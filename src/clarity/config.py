@@ -12,6 +12,7 @@ class ModelConfig:
     dropout: float = 0.3
     freq_branch: bool = True
     cbam_reduction: int = 16
+    model_version: str = "v2"  # "v1"=baseline (single Laplacian+CBAM), "v2"=improved
 
 
 @dataclass

@@ -1,11 +1,15 @@
-"""Unit tests for ClarityNet architecture."""
+"""Unit tests for ClarityNet v1 and v2 architectures."""
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import pytest
 import torch
-from clarity.model import ClarityNet, LaplacianLayer, FrequencyBranch, laplacian_variance_feature
+from clarity.model import (
+    ClarityNet, LaplacianLayer, FrequencyBranch, MultiScaleFrequencyBranch,
+    FFTSharpnessFeature, CoordinateAttention, laplacian_variance_feature,
+    multi_scale_sharpness_scalars,
+)
 from clarity.losses import FocalLoss, ClarityLoss
 
 
@@ -18,7 +22,12 @@ def device():
 
 @pytest.fixture
 def model(device):
-    return ClarityNet(backbone="convnext_tiny", pretrained=False).to(device)
+    return ClarityNet(backbone="convnextv2_tiny", pretrained=False, model_version="v2").to(device)
+
+
+@pytest.fixture
+def model_v1(device):
+    return ClarityNet(backbone="convnextv2_tiny", pretrained=False, model_version="v1").to(device)
 
 
 def _rand_batch(B=2, C=3, H=224, W=224, device="cpu"):
@@ -50,10 +59,16 @@ class TestModelForward:
         assert all(c >= 0 and c <= 1 for c in result["confidence"].tolist())
 
     def test_no_freq_branch(self, device):
-        m = ClarityNet(backbone="convnext_tiny", pretrained=False, freq_branch=False).to(device)
+        m = ClarityNet(backbone="convnextv2_tiny", pretrained=False, freq_branch=False).to(device)
         x = _rand_batch(device=device)
         out = m(x)
         assert out["logits"].shape == (2, 2)
+
+    def test_v1_model(self, model_v1, device):
+        x = _rand_batch(device=device)
+        out = model_v1(x)
+        assert out["logits"].shape == (2, 2)
+        assert out["blur_score"].min() >= 0.0
 
     def test_small_input_size(self, model, device):
         x = _rand_batch(B=1, H=128, W=128, device=device)
@@ -80,22 +95,60 @@ class TestFrequencyBranch:
         assert out.min() >= 0.0
         assert out.max() <= 1.0 + 1e-5
 
-    def test_freq_branch_output(self, device):
+    def test_freq_branch_v1_output(self, device):
         fb = FrequencyBranch(out_dim=128).to(device)
         x = _rand_batch(device=device)
         out = fb(x)
         assert out.shape == (2, 128)
 
+    def test_multiscale_freq_branch_output(self, device):
+        fb = MultiScaleFrequencyBranch(out_dim=256).to(device)
+        x = _rand_batch(device=device)
+        out = fb(x)
+        assert out.shape == (2, 256)
+
+    def test_fft_sharpness_feature(self, device):
+        fft = FFTSharpnessFeature().to(device)
+        x = _rand_batch(B=4, device=device)
+        out = fft(x)
+        assert out.shape == (4, 3)
+
+    def test_fft_sharp_vs_blurry(self, device):
+        """FFT should give higher values for sharp images (more high-freq energy)."""
+        import numpy as np, cv2
+        fft = FFTSharpnessFeature().to(device)
+        sharp_np = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
+        blurry_np = cv2.GaussianBlur(sharp_np, (21, 21), 5.0)
+        mean = (0.485, 0.456, 0.406)
+        std = (0.229, 0.224, 0.225)
+        def to_tensor(img):
+            t = torch.from_numpy(img).float().permute(2,0,1) / 255.0
+            for c in range(3):
+                t[c] = (t[c] - mean[c]) / std[c]
+            return t.unsqueeze(0).to(device)
+        s_feats = fft(to_tensor(sharp_np))
+        b_feats = fft(to_tensor(blurry_np))
+        # High-freq ratio (index 2) should be higher for sharp image
+        assert s_feats[0, 2] > b_feats[0, 2]
+
     def test_laplacian_variance_feature(self, device):
         x = _rand_batch(B=3, device=device)
         var = laplacian_variance_feature(x)
         assert var.shape == (3, 1)
-        # Blurrier images should have lower variance
-        blurry = torch.zeros_like(x)  # all black = no edges = low variance
-        sharp = torch.rand_like(x)    # random = many edges
-        var_blurry = laplacian_variance_feature(blurry)
-        var_sharp = laplacian_variance_feature(sharp)
-        assert var_sharp.mean() > var_blurry.mean()
+        blurry = torch.zeros_like(x)
+        sharp = torch.rand_like(x)
+        assert laplacian_variance_feature(sharp).mean() > laplacian_variance_feature(blurry).mean()
+
+    def test_multi_scale_sharpness_scalars(self, device):
+        x = _rand_batch(B=3, device=device)
+        feats = multi_scale_sharpness_scalars(x)
+        assert feats.shape == (3, 3)
+
+    def test_coordinate_attention(self, device):
+        ca = CoordinateAttention(dim=256).to(device)
+        x = torch.randn(4, 256, device=device)
+        out = ca(x)
+        assert out.shape == (4, 256)
 
 
 class TestLosses:

@@ -46,6 +46,7 @@ class Trainer:
             dropout=cfg.model.dropout,
             freq_branch=cfg.model.freq_branch,
             cbam_reduction=cfg.model.cbam_reduction,
+            model_version=getattr(cfg.model, "model_version", "v2"),
         ).to(self.device)
 
         self.criterion = ClarityLoss(
@@ -61,8 +62,9 @@ class Trainer:
             weight_decay=cfg.training.weight_decay,
         )
 
-        # Compute total steps after we know the data size
-        train_loader = self.data.train_loader()
+        # Compute total steps; v2 uses CutBlur + balanced sampler
+        use_v2_data = getattr(cfg.model, "model_version", "v2") == "v2"
+        train_loader = self.data.train_loader(use_cutblur=use_v2_data, balanced=use_v2_data)
         total_steps = cfg.training.epochs * len(train_loader)
         warmup_steps = cfg.training.warmup_epochs * len(train_loader)
 
@@ -136,7 +138,11 @@ class Trainer:
             self.data.set_image_size(current_size)
 
             t0 = time.time()
-            train_metrics = self._run_epoch(self.data.train_loader(), training=True)
+            use_v2_data = getattr(self.cfg.model, "model_version", "v2") == "v2"
+            train_metrics = self._run_epoch(
+                self.data.train_loader(use_cutblur=use_v2_data, balanced=use_v2_data),
+                training=True,
+            )
             val_metrics = self._run_epoch(self.data.val_loader(), training=False)
             elapsed = time.time() - t0
 

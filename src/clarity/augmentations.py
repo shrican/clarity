@@ -1,9 +1,13 @@
 """
 Augmentation pipelines for blur detection training.
 
-Sharp → random crop/flip/color jitter (no blur)
-Blurry → all of the above + optional additional blur for hard examples
-Synthetic blur generation for data augmentation and hard-negative mining.
+Sharp → random crop/flip/color jitter (NO blur applied)
+Blurry → all of the above (hard-negative mining via BlurDetectionDataset)
+Synthetic blur generation for dataset creation and hard-negative mining.
+
+CutBlur: domain-specific augmentation that cuts a blurry patch into a sharp
+image, forcing the model to find blur regions rather than using global cues.
+This is the blur-detection equivalent of CutMix but preserves high-freq stats.
 """
 from __future__ import annotations
 import random
@@ -19,7 +23,7 @@ def _motion_blur_kernel(size: int, angle: float) -> np.ndarray:
     kernel = np.zeros((size, size), dtype=np.float32)
     cx = size // 2
     kernel[cx, :] = 1.0
-    M = cv2.getRotationMatrix2D((cx, cx), angle, 1.0)
+    M = cv2.getRotationMatrix2D((float(cx), float(cx)), angle, 1.0)
     kernel = cv2.warpAffine(kernel, M, (size, size))
     return kernel / kernel.sum()
 
@@ -48,6 +52,36 @@ def apply_synthetic_blur(image: np.ndarray, blur_type: str | None = None) -> tup
         result = cv2.filter2D(image, -1, kernel)
 
     return result, blur_type
+
+
+def apply_cutblur(
+    sharp: np.ndarray,
+    blur_prob: float = 0.5,
+    patch_ratio: float = 0.4,
+) -> tuple[np.ndarray, int]:
+    """
+    CutBlur: cut a random rectangular patch from a synthetically blurred version
+    of the same sharp image and paste it back. The result is labeled BLURRY.
+
+    This forces the model to detect blur from local regions rather than relying
+    on global image statistics — harder, more generalizable examples.
+
+    Returns (augmented_image, label). Called only on sharp images.
+    """
+    if random.random() > blur_prob:
+        return sharp, 0  # keep sharp
+
+    blurry, _ = apply_synthetic_blur(sharp)
+
+    H, W = sharp.shape[:2]
+    ph = int(H * random.uniform(patch_ratio * 0.5, patch_ratio))
+    pw = int(W * random.uniform(patch_ratio * 0.5, patch_ratio))
+    py = random.randint(0, H - ph)
+    px = random.randint(0, W - pw)
+
+    result = sharp.copy()
+    result[py:py+ph, px:px+pw] = blurry[py:py+ph, px:px+pw]
+    return result, 1  # labeled blurry because it contains a blurry region
 
 
 def get_train_transform(image_size: int = 224) -> A.Compose:

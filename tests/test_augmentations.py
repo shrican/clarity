@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 import numpy as np
 import pytest
 from clarity.augmentations import (
-    apply_synthetic_blur, get_train_transform,
+    apply_synthetic_blur, apply_cutblur, get_train_transform,
     get_val_transform, get_tta_transforms,
 )
 
@@ -32,6 +32,18 @@ class TestSyntheticBlur:
         img = _rand_image()
         result, btype = apply_synthetic_blur(img, "defocus")
         assert result.shape == img.shape
+
+    def test_cutblur_output(self):
+        img = _rand_image()
+        result, label = apply_cutblur(img, blur_prob=1.0)
+        assert result.shape == img.shape
+        assert label == 1  # forced blurry
+
+    def test_cutblur_passthrough(self):
+        img = _rand_image()
+        result, label = apply_cutblur(img, blur_prob=0.0)
+        assert label == 0  # kept sharp
+        assert (result == img).all()
 
     def test_random_blur_type(self):
         img = _rand_image()

@@ -15,35 +15,58 @@ that are the primary discriminative signal for sharpness detection.
 """
 from __future__ import annotations
 import random
-from typing import Literal
+from collections import Counter
 import numpy as np
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader
-from datasets import load_dataset, concatenate_datasets, Dataset as HFDataset
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from datasets import load_dataset
 import torch
 
 from clarity.config import Config
 from clarity.augmentations import (
     get_train_transform, get_val_transform, get_tta_transforms,
-    apply_synthetic_blur,
+    apply_synthetic_blur, apply_cutblur,
 )
 
 LABEL_SHARP = 0
 LABEL_BLURRY = 1
 
 
+def get_balanced_sampler(records: list[tuple[np.ndarray, int]]) -> WeightedRandomSampler:
+    """
+    WeightedRandomSampler that gives each class equal expected frequency.
+    Prevents the model from exploiting class imbalance.
+    """
+    labels = [l for _, l in records]
+    counts = Counter(labels)
+    total = len(labels)
+    weights = [total / counts[l] for l in labels]
+    return WeightedRandomSampler(
+        weights=weights,
+        num_samples=total,
+        replacement=True,
+    )
+
+
 class BlurDetectionDataset(Dataset):
-    """Wraps a list of (image_array, label) pairs with transforms."""
+    """
+    Wraps (image_array, label) records with transforms and online augmentation.
+
+    cutblur_prob > 0: applies CutBlur to sharp images → domain-specific hard negatives
+    hard_negative_prob > 0: applies synthetic blur to sharp images
+    """
 
     def __init__(
         self,
         records: list[tuple[np.ndarray, int]],
         transform,
         hard_negative_prob: float = 0.0,
+        cutblur_prob: float = 0.0,
     ):
         self.records = records
         self.transform = transform
         self.hard_negative_prob = hard_negative_prob
+        self.cutblur_prob = cutblur_prob
 
     def __len__(self) -> int:
         return len(self.records)
@@ -51,10 +74,14 @@ class BlurDetectionDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         img_np, label = self.records[idx]
 
-        # Hard-negative: take a sharp image and apply extra blur → still labeled blurry
-        if label == LABEL_SHARP and random.random() < self.hard_negative_prob:
-            img_np, _ = apply_synthetic_blur(img_np)
-            label = LABEL_BLURRY
+        if label == LABEL_SHARP:
+            # CutBlur: paste blurry patch onto sharp → hard example
+            if self.cutblur_prob > 0:
+                img_np, label = apply_cutblur(img_np, blur_prob=self.cutblur_prob)
+            # Hard-negative fallback: full synthetic blur
+            elif self.hard_negative_prob > 0 and random.random() < self.hard_negative_prob:
+                img_np, _ = apply_synthetic_blur(img_np)
+                label = LABEL_BLURRY
 
         augmented = self.transform(image=img_np)["image"]
         return {"image": augmented, "label": torch.tensor(label, dtype=torch.long)}
@@ -172,18 +199,21 @@ class BlurDataModule:
         """Progressive resizing: swap transforms mid-training."""
         self._train_transform = get_train_transform(size)
 
-    def train_loader(self) -> DataLoader:
+    def train_loader(self, use_cutblur: bool = True, balanced: bool = True) -> DataLoader:
         ds = BlurDetectionDataset(
             self.train_records,
             self._train_transform,
-            hard_negative_prob=0.15,
+            hard_negative_prob=0.10 if not use_cutblur else 0.0,
+            cutblur_prob=0.20 if use_cutblur else 0.0,
         )
+        sampler = get_balanced_sampler(self.train_records) if balanced else None
         return DataLoader(
             ds,
             batch_size=self.cfg.training.batch_size,
-            shuffle=True,
+            shuffle=(sampler is None),
+            sampler=sampler,
             num_workers=self.cfg.dataset.num_workers,
-            pin_memory=False,  # MPS doesn't benefit from pinned memory
+            pin_memory=False,
             drop_last=True,
         )
 
