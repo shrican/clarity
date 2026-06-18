@@ -1,5 +1,5 @@
 model:
-  backbone: convnext_tiny  # timm model name
+  backbone: convnextv2_tiny  # timm model name; V2 has GRN for better feature diversity
   pretrained: true
   num_classes: 2
   dropout: 0.3
@@ -7,7 +7,12 @@ model:
   cbam_reduction: 16
 
 dataset:
-  name: wtcherr/unsplash_10k_blur_rand_KS
+  # Stage 1 (pretraining): synthetic blur from Unsplash pairs
+  pretrain_dataset: wtcherr/unsplash_10k_blur_rand_KS
+  # Stage 2 (fine-tuning): real blur labels from CUHK + Flickr-Blur
+  finetune_datasets:
+    - chitradrishti/cuhk-blur
+    - chitradrishti/Flickr-Blur
   image_size: 224
   val_split: 0.15
   test_split: 0.10
@@ -25,7 +30,9 @@ training:
   label_smoothing: 0.1
   grad_clip: 1.0
   aux_loss_weight: 0.3    # weight for auxiliary regression loss
-  mixup_alpha: 0.4
+  # Mixup disabled: mixing images corrupts high-freq edge statistics (sharpness signal)
+  # Use only 0.0 or very small alpha for blur detection
+  mixup_alpha: 0.0
   progressive_sizes: [128, 192, 224]  # progressive resizing schedule
 
 eval:

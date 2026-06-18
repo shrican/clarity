@@ -6,7 +6,7 @@ from pathlib import Path
 
 @dataclass
 class ModelConfig:
-    backbone: str = "convnext_tiny"
+    backbone: str = "convnextv2_tiny"  # V2 has GRN for better feature decorrelation
     pretrained: bool = True
     num_classes: int = 2
     dropout: float = 0.3
@@ -16,7 +16,13 @@ class ModelConfig:
 
 @dataclass
 class DatasetConfig:
-    name: str = "wtcherr/unsplash_10k_blur_rand_KS"
+    # Stage 1: synthetic pairs (guide=sharp, image=blurry) for pretraining at scale
+    pretrain_dataset: str = "wtcherr/unsplash_10k_blur_rand_KS"
+    # Stage 2: real labeled datasets for fine-tuning (each must have image + label columns)
+    finetune_datasets: list = field(default_factory=lambda: [
+        "chitradrishti/cuhk-blur",
+        "chitradrishti/Flickr-Blur",
+    ])
     image_size: int = 224
     val_split: float = 0.15
     test_split: float = 0.10
@@ -36,7 +42,7 @@ class TrainingConfig:
     label_smoothing: float = 0.1
     grad_clip: float = 1.0
     aux_loss_weight: float = 0.3
-    mixup_alpha: float = 0.4
+    mixup_alpha: float = 0.0  # disabled: Mixup corrupts high-freq edge statistics (sharpness signal)
     progressive_sizes: list = field(default_factory=lambda: [128, 192, 224])
 
 
@@ -71,7 +77,11 @@ class Config:
         if "model" in raw:
             cfg.model = ModelConfig(**raw["model"])
         if "dataset" in raw:
-            cfg.dataset = DatasetConfig(**raw["dataset"])
+            ds_raw = dict(raw["dataset"])
+            # backward compat: old single 'name' key maps to pretrain_dataset
+            if "name" in ds_raw and "pretrain_dataset" not in ds_raw:
+                ds_raw["pretrain_dataset"] = ds_raw.pop("name")
+            cfg.dataset = DatasetConfig(**ds_raw)
         if "training" in raw:
             cfg.training = TrainingConfig(**raw["training"])
         if "eval" in raw:

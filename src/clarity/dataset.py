@@ -1,13 +1,17 @@
 """
-Blur detection dataset pipeline.
+Blur detection dataset pipeline — two-stage loading strategy:
 
-Primary source: wtcherr/unsplash_10k_blur_rand_KS
+Stage 1 (pretraining): wtcherr/unsplash_10k_blur_rand_KS
   - 'guide' column → PIL image (SHARP, label=0)
   - 'image' column → PIL image (BLURRY, label=1)
+  - ~20k synthetic paired examples for robust base features
 
-Augmentation:
-  - Hard-negative mining: apply extra synthetic blur to some sharp images
-  - Mixup on the fly in the collate_fn
+Stage 2 (fine-tuning, optional): chitradrishti/cuhk-blur + chitradrishti/Flickr-Blur
+  - Real camera blur/sharp images with folder-based labels
+  - Loaded if available; gracefully skipped on error (license/access issues)
+
+Note: Mixup is NOT applied — it corrupts the high-frequency edge statistics
+that are the primary discriminative signal for sharpness detection.
 """
 from __future__ import annotations
 import random
@@ -62,28 +66,83 @@ def _pil_to_np(pil: Image.Image) -> np.ndarray:
     return np.array(pil, dtype=np.uint8)
 
 
-def _load_hf_records(cfg: Config) -> tuple[list, list, list]:
+def _load_pretrain_records(cfg: Config) -> list[tuple[np.ndarray, int]]:
     """
-    Download the HuggingFace dataset and return (train_records, val_records, test_records).
-    Each record is (np.ndarray H×W×3, label).
+    Load Stage 1 dataset: wtcherr/unsplash paired images.
+    guide=sharp (label 0), image=blurry (label 1).
     """
-    print(f"Loading dataset: {cfg.dataset.name}")
-    ds = load_dataset(cfg.dataset.name, cache_dir=cfg.dataset.cache_dir, split="train")
+    print(f"[Stage 1] Loading pretrain dataset: {cfg.dataset.pretrain_dataset}")
+    ds = load_dataset(cfg.dataset.pretrain_dataset, cache_dir=cfg.dataset.cache_dir, split="train")
 
     records: list[tuple[np.ndarray, int]] = []
-
     for sample in ds:
-        # 'guide' = original sharp, 'image' = blurred version
         if "guide" in sample and sample["guide"] is not None:
             records.append((_pil_to_np(sample["guide"]), LABEL_SHARP))
         if "image" in sample and sample["image"] is not None:
             records.append((_pil_to_np(sample["image"]), LABEL_BLURRY))
 
-    print(f"Total samples loaded: {len(records)}")
-    print(f"  Sharp: {sum(1 for _, l in records if l == LABEL_SHARP)}")
-    print(f"  Blurry: {sum(1 for _, l in records if l == LABEL_BLURRY)}")
+    print(f"  Loaded {len(records)} records (sharp: {sum(1 for _,l in records if l==0)}, "
+          f"blurry: {sum(1 for _,l in records if l==1)})")
+    return records
 
-    # Deterministic shuffle before split
+
+def _load_finetune_records(cfg: Config) -> list[tuple[np.ndarray, int]]:
+    """
+    Load Stage 2 datasets: CUHK-Blur + Flickr-Blur (real labeled images).
+    These use imagefolder format where the folder name encodes the label.
+    Silently skips datasets that fail (license/access/format issues).
+    """
+    records: list[tuple[np.ndarray, int]] = []
+    for ds_name in cfg.dataset.finetune_datasets:
+        try:
+            print(f"[Stage 2] Loading fine-tune dataset: {ds_name}")
+            ds = load_dataset(ds_name, cache_dir=cfg.dataset.cache_dir, split="train")
+            sample = next(iter(ds))
+            keys = set(sample.keys())
+
+            if "label" in keys and "image" in keys:
+                # Standard imagefolder format with integer labels
+                label_names = ds.features["label"].names if hasattr(ds.features.get("label"), "names") else []
+                for item in ds:
+                    img = item["image"]
+                    lbl = item["label"]
+                    # Map label names to SHARP=0 / BLURRY=1
+                    if label_names:
+                        name = label_names[lbl].lower()
+                        mapped = LABEL_BLURRY if any(w in name for w in ("blur", "blurry", "defocus", "motion")) else LABEL_SHARP
+                    else:
+                        mapped = int(lbl)
+                    records.append((_pil_to_np(img), mapped))
+
+            elif "image" in keys and len(keys) == 1:
+                # Images only (Flickr-Blur): no labels available, skip
+                print(f"  Skipping {ds_name}: no labels found (image-only dataset)")
+                continue
+
+            print(f"  Loaded {len(records)} total fine-tune records from {ds_name}")
+
+        except Exception as exc:
+            print(f"  Skipping {ds_name}: {exc}")
+
+    return records
+
+
+def _load_hf_records(cfg: Config) -> tuple[list, list, list]:
+    """
+    Load all records and split into (train, val, test).
+    Stage 1 (synthetic) + Stage 2 (real, if available) are combined.
+    """
+    records = _load_pretrain_records(cfg)
+
+    finetune = _load_finetune_records(cfg)
+    if finetune:
+        print(f"Adding {len(finetune)} real-label fine-tune records")
+        records.extend(finetune)
+
+    print(f"Total samples: {len(records)} | "
+          f"sharp: {sum(1 for _,l in records if l==0)} | "
+          f"blurry: {sum(1 for _,l in records if l==1)}")
+
     rng = np.random.RandomState(42)
     indices = rng.permutation(len(records))
     records = [records[i] for i in indices]
